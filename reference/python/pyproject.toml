@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gezk"
+version = "0.5.0"
+description = "Reference reader for gezk knowledge catalogs (.gezk): verify, browse, search and cite."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = ["brotli>=1.1"]
+
+[project.optional-dependencies]
+signing = ["cryptography>=42"]
+test = ["pytest>=8", "jsonschema>=4.20", "cryptography>=42"]
+
+[project.scripts]
+gezk = "gezk.cli:main"
+
+[tool.setuptools]
+packages = ["gezk"]

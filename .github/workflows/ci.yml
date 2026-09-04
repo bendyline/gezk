@@ -1,0 +1,27 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  reference-python:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install the reference reader
+        run: python -m pip install --upgrade pip && python -m pip install -e 'reference/python[test]'
+      - name: Conformance
+        run: python -m pytest reference/python/tests -q
+      - name: Schemas validate the fixture manifest
+        run: python reference/python/tests/validate_schemas.py
+      - name: CLI reads and verifies the fixture
+        run: |
+          python -c "import json,sys; json.dump([json.load(open('conformance/vectors.json'))['signature']], sys.stdout)" > anchors.json
+          gezk inspect conformance/fixtures/conformance-0.5.gezk
+          gezk verify conformance/fixtures/conformance-0.5.gezk --deep --anchors anchors.json
+          gezk search conformance/fixtures/conformance-0.5.gezk "lattice ember"
