@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://bendyline.github.io/gezk/schemas/embedding-profile.schema.json",
+  "$id": "https://bendyline.com/gezk/0.5/schemas/embedding-profile.schema.json",
   "type": "object",
   "properties": {
     "id": {

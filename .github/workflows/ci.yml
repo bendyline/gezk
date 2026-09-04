@@ -22,6 +22,6 @@ jobs:
       - name: CLI reads and verifies the fixture
         run: |
           python -c "import json,sys; json.dump([json.load(open('conformance/vectors.json'))['signature']], sys.stdout)" > anchors.json
-          gezk inspect conformance/fixtures/conformance-0.5.gezk
+          python -m gezk inspect conformance/fixtures/conformance-0.5.gezk
           gezk verify conformance/fixtures/conformance-0.5.gezk --deep --anchors anchors.json
           gezk search conformance/fixtures/conformance-0.5.gezk "lattice ember"

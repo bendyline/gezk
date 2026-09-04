@@ -35,7 +35,7 @@ implementation reproduces with a few dozen lines of code.
 | Path | What |
 | --- | --- |
 | [`spec/gezk-0.5.md`](spec/gezk-0.5.md) | The specification (CC BY 4.0) |
-| [`schemas/`](schemas/) | JSON Schemas for the manifest, registry, notices and profiles (generated) |
+| [`schemas/`](schemas/) | JSON Schemas for the manifest, registry, notices and profiles (generated), also served at their `$id` &mdash; [bendyline.com/gezk/0.5/schemas/](https://bendyline.com/gezk/0.5/schemas/) |
 | [`conformance/`](conformance/) | Test vectors and a signed fixture catalog every implementation must reproduce (generated) |
 | [`reference/python/`](reference/python/) | A reference reader in Python (standard library + `brotli`) with a small CLI |
 | [`recipes/`](recipes/) | Working with catalogs from other tools |
@@ -47,7 +47,8 @@ implementation reproduces with a few dozen lines of code.
   (compiler, verified archive reader, retrieval), maintained in the
   [gezel](https://github.com/bendyline/gezel) repository. The schemas and the
   conformance kit here are generated from it.
-- **Python** — the reference reader in `reference/python/`.
+- **Python** — the reference reader in `reference/python/`, installed from
+  this repository; there is no PyPI release.
 
 ## Publishing catalogs
 

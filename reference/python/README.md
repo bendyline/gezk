@@ -6,8 +6,25 @@ two-stage semantic search, and format `knowledge://` citations. Standard
 library plus `brotli` (document bodies); Ed25519 signature verification
 needs the `signing` extra (`cryptography`).
 
+## Install from this repository
+
+There is no PyPI release, by choice: this is a reference implementation held
+to `conformance/`, versioned with the format rather than on its own cadence.
+Install it from a checkout.
+
 ```bash
-pip install 'gezk[signing]'
+git clone https://github.com/bendyline/gezk.git
+cd gezk
+python -m pip install -e 'reference/python[signing]'
+```
+
+That puts a `gezk` command on your PATH. `python -m gezk` runs the same entry
+point by import path, which is the safer form inside a script or when several
+environments are in play. The `signing` extra adds `cryptography` for Ed25519
+verification; without it everything but signature checking still works, and
+asking for a check anyway fails rather than passing quietly.
+
+```bash
 gezk inspect physics-en-2026.9.1.gezk
 gezk verify  physics-en-2026.9.1.gezk --deep --key publisher.pub.pem
 gezk search  physics-en-2026.9.1.gezk "newton laws"

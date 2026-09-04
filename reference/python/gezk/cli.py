@@ -52,7 +52,10 @@ def _signature_check(manifest: dict, anchors: list[dict]) -> tuple[str, str, str
     try:
         ok, reason = verify_manifest(manifest, anchors)
     except RuntimeError as err:
-        return ("signature", "warn", f"not checked: {err}")
+        # Anchors were supplied, so a check was asked for. Being unable to run
+        # it is a failure, not a warning: passing here would let a pipeline
+        # that forgot the signing extra report catalogs as verified.
+        return ("signature", "FAIL", f"cannot verify: {err}")
     detail = f"key {signature['keyId']}" if ok and signature else reason
     return ("signature", "ok" if ok else "FAIL", detail)
 

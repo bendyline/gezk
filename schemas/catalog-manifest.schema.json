@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://bendyline.github.io/gezk/schemas/catalog-manifest.schema.json",
+  "$id": "https://bendyline.com/gezk/0.5/schemas/catalog-manifest.schema.json",
   "type": "object",
   "properties": {
     "kind": {

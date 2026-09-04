@@ -176,3 +176,36 @@ def test_cli_verify_fails_a_rewritten_manifest_under_anchors(tmp_path):
     key_file.write_text(sig["publicKeyPem"])
     assert main(["verify", str(FIXTURE), "--key", str(key_file)]) == 0
     assert main(["verify", str(forged), "--key", str(key_file)]) == 1
+
+
+def test_module_entry_point_matches_the_console_script():
+    """`python -m gezk` is what recipes/README.md tells readers to run, and it
+    needs a `__main__.py` the console script does not."""
+    import subprocess
+    import sys
+
+    proc = subprocess.run(
+        [sys.executable, "-m", "gezk", "inspect", str(FIXTURE)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert VECTORS["fixture"]["catalogId"] in proc.stdout
+
+
+def test_unverifiable_signature_fails_when_a_check_was_asked_for(tmp_path, monkeypatch):
+    """Anchors mean the caller asked for verification. If `cryptography` is
+    missing the answer is FAIL, never a pass with a warning."""
+    import gezk.cli as cli
+
+    def no_crypto(*_args, **_kwargs):
+        raise RuntimeError("signature verification needs the 'cryptography' package")
+
+    monkeypatch.setattr(cli, "verify_manifest", no_crypto)
+    anchors_file = tmp_path / "anchors.json"
+    anchors_file.write_text(json.dumps([VECTORS["signature"]]))
+
+    assert cli.main(["verify", str(FIXTURE), "--anchors", str(anchors_file)]) == 1
+    # Without anchors nothing was asked for, so the same install still passes.
+    assert cli.main(["verify", str(FIXTURE)]) == 0
