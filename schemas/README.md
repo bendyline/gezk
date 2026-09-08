@@ -1,24 +1,17 @@
-# gezk 0.5 JSON Schemas
+# gezk JSON Schemas
 
-Generated from the `@bendyline/gezk` Zod definitions by
-`pnpm --filter @bendyline/gezk export-schemas` in the gezel repository —
-do not edit by hand. Refinements that JSON Schema cannot express (the
-Windows reserved-name rule on versions, NFC normalization of document ids)
-are enforced by conforming readers on top of these schemas.
+One directory per format version, each generated from the `@bendyline/gezk`
+Zod definitions of that line by `pnpm --filter @bendyline/gezk export-schemas`
+in the gezel repository — do not edit by hand. A catalog's `manifest.json`
+names its `formatVersion`; validate it against that directory. Every file's
+`$id` is its address on bendyline.com, which serves the same bytes, and the
+path carries the version, so a later line never overwrites the schemas that
+catalogs published under an earlier one point at.
 
-Each file's `$id` is its address on bendyline.com, which serves the same
-bytes:
-
-<https://bendyline.com/gezk/0.5/schemas/>
-
-The path carries the format version, so a later line never overwrites the
-schemas that catalogs published under 0.5 point at.
-
-| File | Validates |
+| Version | Served at |
 | --- | --- |
-| `catalog-manifest.schema.json` | `manifest.json` inside a `.gezk` |
-| `registry-index.schema.json` | A publisher's registry `index.json` |
-| `source-notices.schema.json` | `LICENSES/source-notices.json` |
-| `embedding-profile.schema.json` | The `embedding` block of a manifest |
-| `chunking-profile.schema.json` | The `chunking` block of a manifest |
-| `catalog-document.schema.json` | One normalized document fed to a compiler |
+| [`0.5/`](0.5/) | <https://bendyline.com/gezk/0.5/schemas/> |
+| [`0.6/`](0.6/) | <https://bendyline.com/gezk/0.6/schemas/> |
+
+The current line is `0.6`. An earlier directory is frozen once its line
+stops being written; the specification for each lives in `spec/`.

@@ -1,9 +1,8 @@
-"""`gezk` command line: inspect, verify, extract, search."""
+"""`gezk` command line: inspect, toc, verify, extract, search."""
 
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import sys
 import tempfile
@@ -77,12 +76,37 @@ def cmd_inspect(args: argparse.Namespace) -> int:
     print(f"  language   {manifest['language']}")
     print(f"  license    {manifest['license']['name']} (notice: {manifest['license']['noticePath']})")
     c = manifest["counts"]
-    print(f"  counts     {c['documents']} documents, {c['chunks']} chunks, {c['shards']} shards")
+    assets = f", {c['assets']} assets" if c.get("assets") else ""
+    print(f"  counts     {c['documents']} documents, {c['chunks']} chunks, {c['shards']} shards{assets}")
     print(f"  embedding  {manifest['embedding']['id']} ({manifest['embedding']['model']['repo']}@{manifest['embedding']['model']['revision'][:12]})")
     print(f"  chunking   {manifest['chunking']['id']}")
     sig = manifest.get("signature")
     print(f"  signature  {'ed25519 key ' + sig['keyId'] if sig else 'unsigned'}")
     print(f"  sha256     {archive_sha256(args.archive)}")
+    return 0
+
+
+def cmd_toc(args: argparse.Namespace) -> int:
+    """The shipped table of contents as a tree, each topic with the documents
+    filed at it and, when different, the total across its subtree."""
+    with tempfile.TemporaryDirectory(prefix="gezk-toc-") as tmp:
+        root = _materialize(args.archive, tmp)
+        cat = Catalog(root)
+        try:
+            children: dict = {}
+            for topic in cat.topics():
+                children.setdefault(topic["parent_id"], []).append(topic)
+
+            def walk(parent, depth: int) -> None:
+                for topic in children.get(parent, []):
+                    direct, total = topic["document_count"], topic["total_document_count"]
+                    rollup = f" ({total} in subtree)" if total != direct else ""
+                    print(f"{'  ' * depth}{topic['name']}  [{topic['id']}]  {direct} documents{rollup}")
+                    walk(topic["id"], depth + 1)
+
+            walk(None, 0)
+        finally:
+            cat.close()
     return 0
 
 
@@ -155,6 +179,9 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("inspect", help="print a catalog's manifest summary")
     p.add_argument("archive")
     p.set_defaults(fn=cmd_inspect)
+    p = sub.add_parser("toc", help="print the table of contents with document counts")
+    p.add_argument("archive")
+    p.set_defaults(fn=cmd_toc)
     p = sub.add_parser("verify", help="extract and validate a catalog")
     p.add_argument("archive")
     p.add_argument("--deep", action="store_true")

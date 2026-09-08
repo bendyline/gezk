@@ -14,7 +14,12 @@ from .signature import verify_manifest
 
 MIME_TYPE = "application/vnd.gezk+zip"
 MANIFEST_KIND = "gezk-catalog"
-FORMAT_VERSION = "0.5"
+# Each format version pairs with exactly one index schema; a manifest that
+# pairs them otherwise is corrupt (spec §1). The last entry is the current
+# line, the one a writer emits.
+FORMAT_GENERATIONS = {"0.5": 2, "0.6": 3}
+SUPPORTED_FORMAT_VERSIONS = tuple(FORMAT_GENERATIONS)
+FORMAT_VERSION = SUPPORTED_FORMAT_VERSIONS[-1]
 MIMETYPE_PATH = "mimetype"
 MANIFEST_PATH = "manifest.json"
 MAX_MANIFEST_BYTES = 16 * 1024 * 1024
@@ -64,11 +69,25 @@ def _parse_manifest(raw: bytes) -> dict:
     if not isinstance(manifest, dict):
         raise GezkError("invalid manifest: not an object", "manifest")
     kind, version = manifest.get("kind"), manifest.get("formatVersion")
-    if kind != MANIFEST_KIND or version != FORMAT_VERSION:
+    if kind != MANIFEST_KIND or version not in FORMAT_GENERATIONS:
         raise GezkError(
             f"unsupported gezk format (kind {kind}, version {version}); this reader supports "
-            f"{MANIFEST_KIND} {FORMAT_VERSION}",
+            f"{MANIFEST_KIND} {', '.join(SUPPORTED_FORMAT_VERSIONS)}",
             "format-version",
+        )
+    schema = manifest.get("indexSchemaVersion")
+    if schema != FORMAT_GENERATIONS[version]:
+        raise GezkError(
+            f"invalid manifest: format {version} pairs with index schema {FORMAT_GENERATIONS[version]}, "
+            f"not {schema}",
+            "manifest",
+        )
+    requires = manifest.get("requires")
+    if isinstance(requires, dict) and requires.get("formatVersion") != version:
+        raise GezkError(
+            f"invalid manifest: requires.formatVersion {requires.get('formatVersion')} differs from "
+            f"formatVersion {version}",
+            "manifest",
         )
     return manifest
 

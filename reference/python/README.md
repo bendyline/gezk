@@ -1,10 +1,11 @@
 # gezk — reference reader (Python)
 
 A small, dependency-light reader for `.gezk` knowledge catalogs: verify an
-archive, browse its table of contents, read documents, run full-text and
-two-stage semantic search, and format `knowledge://` citations. Standard
-library plus `brotli` (document bodies); Ed25519 signature verification
-needs the `signing` extra (`cryptography`).
+archive, browse its table of contents, read documents and their assets, run
+full-text and two-stage semantic search, and format `knowledge://` citations.
+Standard library plus `brotli` (document bodies); Ed25519 signature
+verification needs the `signing` extra (`cryptography`). It reads gezk 0.6
+catalogs and the 0.5 archives published before it (spec §1).
 
 ## Install from this repository
 
@@ -26,6 +27,7 @@ asking for a check anyway fails rather than passing quietly.
 
 ```bash
 gezk inspect physics-en-2026.9.1.gezk
+gezk toc     physics-en-2026.9.1.gezk
 gezk verify  physics-en-2026.9.1.gezk --deep --key publisher.pub.pem
 gezk search  physics-en-2026.9.1.gezk "newton laws"
 ```
@@ -44,6 +46,7 @@ verifies end to end without any other file:
 
 ```bash
 python -c "import json,sys; json.dump([json.load(open('conformance/vectors.json'))['signature']], sys.stdout)" > anchors.json
+gezk verify conformance/fixtures/conformance-0.6.gezk --deep --anchors anchors.json
 gezk verify conformance/fixtures/conformance-0.5.gezk --deep --anchors anchors.json
 ```
 
@@ -56,9 +59,20 @@ from gezk import Catalog, verify_and_extract
 anchors = [{"keyId": "…", "publicKeyPem": "-----BEGIN PUBLIC KEY-----\n…"}]
 manifest = verify_and_extract("physics-en-2026.9.1.gezk", "physics", anchors)
 cat = Catalog("physics")
+for topic in cat.topics():
+    print(topic["id"], topic["document_count"], topic["total_document_count"])
+for doc in cat.documents("mechanics"):
+    print(doc["id"], doc["ordinal"], doc["meta"])
 for hit in cat.search_documents("newton laws"):
     print(hit.document_id, hit.title)
+png = cat.read_asset("assets/figures/pendulum.png")
 ```
+
+`topics()` reports each topic's own documents and the total across its
+subtree; `documents(topic_id)` lists the subtree by default (ordered
+documents first, then by slug) and `descendants=False` narrows it to the
+topic itself. Assets are the images a body references by archive path;
+`read_asset` hands back the bytes the manifest declared, or `None`.
 
 Semantic search takes a unit query vector you produce with the catalog's
 embedding profile (the manifest names the Hugging Face model and revision);

@@ -4,31 +4,90 @@ from __future__ import annotations
 
 import hashlib
 import json
+import zipfile
 from pathlib import Path
 
 import pytest
 
 from gezk import (
+    FORMAT_GENERATIONS,
     Catalog,
     GezkError,
+    asset_references,
     canonicalize,
     chunk_uid,
     content_hash,
     format_uri,
+    is_asset_path,
     key_id,
     parse_uri,
     quantize_bits,
     quantize_int8,
     read_manifest,
+    sniff_asset_type,
+    svg_inertness_problem,
     verify_and_extract,
     verify_manifest,
 )
+from gezk.assets import asset_extension, asset_kind
 from gezk.hashembed import hash_embed_unit
 from gezk.quantize import hamming_top_k
 
 KIT = Path(__file__).resolve().parents[3] / "conformance"
 VECTORS = json.loads((KIT / "vectors.json").read_text("utf-8"))
 FIXTURE = KIT / VECTORS["fixture"]["path"]
+LEGACY = VECTORS.get("legacy", [])
+ANCHORS = [{"keyId": VECTORS["signature"]["keyId"], "publicKeyPem": VECTORS["signature"]["publicKeyPem"]}]
+
+
+@pytest.fixture(scope="module")
+def catalog(tmp_path_factory):
+    root = tmp_path_factory.mktemp("fixture") / "catalog"
+    verify_and_extract(FIXTURE, root, ANCHORS)
+    cat = Catalog(root)
+    yield cat
+    cat.close()
+
+
+def _sha256(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _assert_fixture_facts(cat: Catalog, facts: dict) -> None:
+    """The facts every generation's fixture records: identity, counts, a
+    clean deep validation, the full-text queries, the body round trip and
+    the semantic probe."""
+    m = cat.manifest
+    assert m["id"] == facts["catalogId"] and m["publisher"]["id"] == facts["publisherId"]
+    assert m["version"] == facts["version"]
+    assert m["formatVersion"] == facts.get("formatVersion", VECTORS["formatVersion"])
+    assert (m["counts"]["documents"], m["counts"]["chunks"], m["counts"]["shards"]) == (
+        facts["documents"],
+        facts["chunks"],
+        facts["shards"],
+    )
+    assert [c for c in cat.validate(deep=True) if not c[1]] == []
+    for q in facts["ftsQueries"]:
+        assert q["expectedDocumentId"] in [h.document_id for h in cat.search_documents(q["query"], 5)]
+    doc = cat.get_document(facts["documentRoundTrip"]["documentId"])
+    assert doc is not None
+    assert _sha256(doc["markdown"]) == facts["documentRoundTrip"]["markdownSha256"]
+    probe = facts["semanticProbe"]
+    hits = cat.search_semantic(hash_embed_unit(probe["embedInput"]), final_k=5)
+    assert hits and hits[0].chunk_uid == probe["chunkUid"]
+    assert hits[0].document_id == probe["documentId"]
+
+
+def _rewrite_manifest(source: Path, dest: Path, mutate) -> Path:
+    with zipfile.ZipFile(source) as src, zipfile.ZipFile(dest, "w") as out:
+        for info in src.infolist():
+            data = src.read(info)
+            if info.filename == "manifest.json":
+                m = json.loads(data)
+                mutate(m)
+                data = json.dumps(m).encode("utf-8")
+            out.writestr(info, data, compress_type=zipfile.ZIP_STORED)
+    return dest
 
 
 def test_chunk_ids():
@@ -69,68 +128,152 @@ def test_fixture_digest_and_signature():
     assert hashlib.sha256(data).hexdigest() == VECTORS["fixture"]["sha256"]
     manifest = read_manifest(FIXTURE)
     assert manifest["formatVersion"] == VECTORS["formatVersion"]
+    assert manifest["indexSchemaVersion"] == FORMAT_GENERATIONS[VECTORS["formatVersion"]]
     sig = VECTORS["signature"]
     assert key_id(sig["publicKeyPem"]) == sig["keyId"]
-    anchors = [{"keyId": sig["keyId"], "publicKeyPem": sig["publicKeyPem"]}]
-    assert verify_manifest(manifest, anchors) == (True, "ok")
+    assert verify_manifest(manifest, ANCHORS) == (True, "ok")
     tampered = dict(manifest, **{sig["tamperedField"]: "tampered"})
-    assert verify_manifest(tampered, anchors)[0] is False
+    assert verify_manifest(tampered, ANCHORS)[0] is False
 
 
-def test_fixture_reads_and_searches(tmp_path):
-    manifest = verify_and_extract(FIXTURE, tmp_path / "catalog")
-    f = VECTORS["fixture"]
-    assert manifest["id"] == f["catalogId"] and manifest["publisher"]["id"] == f["publisherId"]
-    assert manifest["counts"] == {"documents": f["documents"], "chunks": f["chunks"], "shards": f["shards"]}
-    cat = Catalog(tmp_path / "catalog")
+def test_fixture_reads_and_searches(catalog):
+    _assert_fixture_facts(catalog, VECTORS["fixture"])
+
+
+def test_nested_topic_rollup(catalog):
+    facts = VECTORS["fixture"]["nestedTopic"]
+    topics = {t["id"]: t for t in catalog.topics()}
+    child, parent = topics[facts["id"]], topics[facts["parentId"]]
+    assert child["parent_id"] == facts["parentId"]
+    assert child["document_count"] == facts["directDocuments"]
+    assert parent["document_count"] == facts["parentDirectDocuments"]
+    assert parent["total_document_count"] == facts["parentTotalDocuments"]
+    assert catalog.document_count(facts["parentId"]) == facts["parentTotalDocuments"]
+    assert catalog.document_count(facts["parentId"], descendants=False) == facts["parentDirectDocuments"]
+
+    subtree = {facts["parentId"]}
+    for topic in catalog.topics():
+        walk, seen = topic, []
+        while walk is not None and walk["id"] not in seen:
+            seen.append(walk["id"])
+            walk = topics.get(walk["parent_id"]) if walk["parent_id"] else None
+        if facts["parentId"] in seen:
+            subtree.add(topic["id"])
+    listed = catalog.documents(facts["parentId"], limit=1000)
+    assert len(listed) == facts["parentTotalDocuments"]
+    assert {d["topic_id"] for d in listed} <= subtree
+    own = catalog.documents(facts["parentId"], limit=1000, descendants=False)
+    assert len(own) == facts["parentDirectDocuments"]
+    assert all(d["topic_id"] == facts["parentId"] for d in own)
+
+
+def test_ordered_listing(catalog):
+    facts = VECTORS["fixture"]["orderedListing"]
+    first = catalog.documents(facts["topicId"], limit=len(facts["firstDocumentIds"]))
+    assert [d["id"] for d in first] == facts["firstDocumentIds"]
+    ordinals = [d["ordinal"] for d in catalog.documents(facts["topicId"], limit=1000)]
+    ranked = [o for o in ordinals if o is not None]
+    assert ordinals[: len(ranked)] == sorted(ranked)
+    assert all(o is None for o in ordinals[len(ranked) :])
+
+
+def test_meta_sample(catalog):
+    facts = VECTORS["fixture"]["metaSample"]
+    doc = catalog.get_document(facts["documentId"])
+    assert doc is not None and doc["meta"] == facts["meta"]
+    listed = next(d for d in catalog.documents(limit=1000) if d["id"] == facts["documentId"])
+    assert listed["meta"] == facts["meta"]
+
+
+def test_assets(catalog):
+    facts = VECTORS["fixture"]
+    keys = ("path", "contentType", "sizeBytes", "sha256")
+    assert [tuple(a[k] for k in keys) for a in catalog.assets()] == [tuple(a[k] for k in keys) for a in facts["assets"]]
+    assert catalog.manifest["counts"]["assets"] == len(facts["assets"])
+    for expected in facts["assets"]:
+        asset = catalog.read_asset(expected["path"])
+        assert asset is not None
+        assert hashlib.sha256(asset["bytes"]).hexdigest() == expected["sha256"]
+        assert sniff_asset_type(asset["bytes"]) == asset_kind(asset_extension(expected["path"]))
+    assert catalog.read_asset("assets/does-not-exist.png") is None
+    ref = facts["assetDocument"]
+    doc = catalog.get_document(ref["documentId"])
+    assert doc is not None and ref["path"] in asset_references(doc["markdown"])
+
+
+def test_asset_rules():
+    assert is_asset_path("assets/diagrams/flow.PNG")
+    assert not is_asset_path("assets/../escape.png")
+    assert not is_asset_path("assets/.hidden.png")
+    assert not is_asset_path("assets/notes.txt")
+    assert sniff_asset_type(b"\x89PNG\r\n\x1a\n" + b"\0" * 16) == "png"
+    assert sniff_asset_type(b"RIFF\0\0\0\0WEBPVP8 ") == "webp"
+    assert sniff_asset_type(b"\xef\xbb\xbf<?xml version=\"1.0\"?><!-- c --><svg xmlns=\"http://www.w3.org/2000/svg\"/>") == "svg"
+    assert sniff_asset_type(b"<html><svg/></html>") is None
+    inert = b"<svg xmlns=\"http://www.w3.org/2000/svg\"><use href=\"#a\"/><image href=\"data:image/png;base64,AA==\"/></svg>"
+    assert svg_inertness_problem(inert) is None
+    assert svg_inertness_problem(b"<svg><script>1</script></svg>") == "contains a <script> element"
+    assert svg_inertness_problem(b"<svg onload=\"x()\"/>") == "contains an event-handler attribute"
+    assert svg_inertness_problem(b"<svg><image href=\"https://example.com/x.png\"/></svg>") == "contains a https: reference in an href"
+    assert svg_inertness_problem(b"<svg><style>a{background:url(http://x/y)}</style></svg>") == "contains a http: reference in a CSS url()"
+    assert svg_inertness_problem(b"\xff\xfe") == "not valid UTF-8"
+
+
+@pytest.mark.parametrize("facts", [pytest.param(entry, id=f"gezk-{entry['formatVersion']}") for entry in LEGACY])
+def test_legacy_fixture_reads_under_its_generation_rules(facts, tmp_path):
+    """A 0.6 reader still opens the earlier generation's fixture: the newer
+    columns read as absent, no assets exist, and every rollup equals the
+    direct count because that generation filed every document at a root."""
+    path = KIT / facts["path"]
+    data = path.read_bytes()
+    assert len(data) == facts["sizeBytes"] and hashlib.sha256(data).hexdigest() == facts["sha256"]
+    manifest = read_manifest(path)
+    assert manifest["formatVersion"] == facts["formatVersion"]
+    assert manifest["indexSchemaVersion"] == FORMAT_GENERATIONS[facts["formatVersion"]]
+    assert verify_manifest(manifest, ANCHORS) == (True, "ok")
+    verify_and_extract(path, tmp_path / "legacy", ANCHORS)
+    cat = Catalog(tmp_path / "legacy")
     try:
-        failed = [c for c in cat.validate(deep=True) if not c[1]]
-        assert failed == []
-        for q in f["ftsQueries"]:
-            assert q["expectedDocumentId"] in [h.document_id for h in cat.search_documents(q["query"], 5)]
-        doc = cat.get_document(f["documentRoundTrip"]["documentId"])
-        assert doc is not None
-        assert hashlib.sha256(doc["markdown"].encode("utf-8")).hexdigest() == f["documentRoundTrip"]["markdownSha256"]
-        probe = f["semanticProbe"]
-        hits = cat.search_semantic(hash_embed_unit(probe["embedInput"]), final_k=5)
-        assert hits and hits[0].chunk_uid == probe["chunkUid"]
-        assert hits[0].document_id == probe["documentId"]
+        assert cat.schema_version == FORMAT_GENERATIONS[facts["formatVersion"]]
+        _assert_fixture_facts(cat, facts)
+        assert cat.assets() == [] and cat.read_asset("assets/mark.png") is None
+        assert all(t["total_document_count"] == t["document_count"] for t in cat.topics())
+        docs = cat.documents(limit=1000)
+        assert len(docs) == facts["documents"]
+        assert all(d["ordinal"] is None and d["meta"] is None for d in docs)
     finally:
         cat.close()
 
 
 def test_rejects_legacy_generation(tmp_path):
-    import zipfile
+    def mutate(m):
+        m["kind"], m["formatVersion"] = "gezel-knowledge-catalog", 1
 
-    legacy = tmp_path / "legacy.gezk"
-    with zipfile.ZipFile(FIXTURE) as src, zipfile.ZipFile(legacy, "w") as out:
-        for info in src.infolist():
-            data = src.read(info)
-            if info.filename == "manifest.json":
-                m = json.loads(data)
-                m["kind"], m["formatVersion"] = "gezel-knowledge-catalog", 1
-                data = json.dumps(m).encode("utf-8")
-            out.writestr(info, data, compress_type=zipfile.ZIP_STORED)
-    with pytest.raises(Exception) as err:
+    legacy = _rewrite_manifest(FIXTURE, tmp_path / "legacy.gezk", mutate)
+    with pytest.raises(GezkError) as err:
         read_manifest(legacy)
-    assert getattr(err.value, "reason", None) == "format-version"
+    assert err.value.reason == "format-version"
+
+
+def test_rejects_a_manifest_that_pairs_version_and_schema_wrongly(tmp_path):
+    def mutate(m):
+        m["indexSchemaVersion"] = 2
+
+    mismatched = _rewrite_manifest(FIXTURE, tmp_path / "mismatched.gezk", mutate)
+    with pytest.raises(GezkError) as err:
+        read_manifest(mismatched)
+    assert err.value.reason == "manifest"
 
 
 def _forged(fixture: Path, dest: Path) -> Path:
     """The fixture with a rewritten publisher and name. `manifest.json` is not
     among its own declared files, so every file digest still reconciles."""
-    import zipfile
 
-    with zipfile.ZipFile(fixture) as src, zipfile.ZipFile(dest, "w") as out:
-        for info in src.infolist():
-            data = src.read(info)
-            if info.filename == "manifest.json":
-                m = json.loads(data)
-                m["name"] = "Totally Legit Catalog"
-                m["publisher"] = {"id": "somebodyelse", "name": "Somebody Else"}
-                data = json.dumps(m).encode("utf-8")
-            out.writestr(info, data, compress_type=zipfile.ZIP_STORED)
-    return dest
+    def mutate(m):
+        m["name"] = "Totally Legit Catalog"
+        m["publisher"] = {"id": "somebodyelse", "name": "Somebody Else"}
+
+    return _rewrite_manifest(fixture, dest, mutate)
 
 
 def test_rewritten_manifest_survives_every_structural_check(tmp_path):
@@ -148,17 +291,15 @@ def test_rewritten_manifest_survives_every_structural_check(tmp_path):
 
 
 def test_anchors_reject_a_rewritten_manifest(tmp_path):
-    sig = VECTORS["signature"]
-    anchors = [{"keyId": sig["keyId"], "publicKeyPem": sig["publicKeyPem"]}]
     forged = _forged(FIXTURE, tmp_path / "forged.gezk")
 
-    assert verify_manifest(read_manifest(forged), anchors) == (False, "bad-signature")
+    assert verify_manifest(read_manifest(forged), ANCHORS) == (False, "bad-signature")
 
     with pytest.raises(GezkError) as err:
-        verify_and_extract(forged, tmp_path / "out", anchors)
+        verify_and_extract(forged, tmp_path / "out", ANCHORS)
     assert err.value.reason == "signature"
 
-    assert verify_and_extract(FIXTURE, tmp_path / "genuine", anchors)["publisher"]["id"] == "bendyline"
+    assert verify_and_extract(FIXTURE, tmp_path / "genuine", ANCHORS)["publisher"]["id"] == "bendyline"
 
 
 def test_cli_verify_fails_a_rewritten_manifest_under_anchors(tmp_path):
@@ -178,6 +319,16 @@ def test_cli_verify_fails_a_rewritten_manifest_under_anchors(tmp_path):
     assert main(["verify", str(forged), "--key", str(key_file)]) == 1
 
 
+def test_cli_toc_shows_the_rollup(capsys):
+    from gezk.cli import main
+
+    facts = VECTORS["fixture"]["nestedTopic"]
+    assert main(["toc", str(FIXTURE)]) == 0
+    out = capsys.readouterr().out
+    assert f"[{facts['parentId']}]  {facts['parentDirectDocuments']} documents ({facts['parentTotalDocuments']} in subtree)" in out
+    assert f"  [{facts['id']}]  {facts['directDocuments']} documents" in out
+
+
 def test_module_entry_point_matches_the_console_script():
     """`python -m gezk` is what recipes/README.md tells readers to run, and it
     needs a `__main__.py` the console script does not."""
@@ -192,6 +343,7 @@ def test_module_entry_point_matches_the_console_script():
     )
     assert proc.returncode == 0, proc.stderr
     assert VECTORS["fixture"]["catalogId"] in proc.stdout
+    assert f"{len(VECTORS['fixture']['assets'])} assets" in proc.stdout
 
 
 def test_unverifiable_signature_fails_when_a_check_was_asked_for(tmp_path, monkeypatch):
