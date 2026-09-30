@@ -24,6 +24,10 @@ RFC 2119.
   `description`, and `counts.assets` is recorded (§4).
 - Images ship under `assets/` and are referenced by archive path (§3.1,
   §3.3, §3.4).
+- Shard assignment is the producer's deterministic choice, and readers
+  must not assume topic-contiguous shards. The reference compiler adds an
+  opt-in semantic fill (§8.1). This is a clarification: no file or reader
+  behaviour changes, and 0.5 readers never depended on it.
 - The conformance kit keeps the earlier generation's fixture under `legacy`
   so readers prove they still open it (§13); the Parquet companion gains
   the two new columns (§14).
@@ -498,11 +502,43 @@ anchor of the `#chunk=` citation fragment (§11).
 
 ### 8.1 Sizing and assignment
 
-Documents are processed in `(topicPathKey, documentId)` order, where
-`topicPathKey` joins the document's topic path with `/`. Shards are filled
-greedily to `router.shardTargetChunks` chunks (200,000 by default; a
-document's chunks never split across shards), so shards come out
-topically coherent.
+A catalog's chunks are divided into shards of about
+`router.shardTargetChunks` chunks (200,000 by default); a document's chunks
+never split across shards. Within a shard, documents are processed in
+`(topicPathKey, documentId)` order, where `topicPathKey` joins the
+document's topic path with `/`.
+
+Which shard a document goes to is the producer's choice, provided the
+choice is deterministic (§10). Readers MUST NOT assume that a shard covers a
+contiguous range of the table of contents: routing (§8.4) uses only the
+centroids (§8.2), and `shards.topic_ids_json` lists whatever leaf topics a
+shard happens to hold. The reference compiler offers two assignments:
+
+- **Topic fill** (the default). Documents in `(topicPathKey, documentId)`
+  order fill shards greedily to `shardTargetChunks`, so shards come out as
+  slices of the table of contents.
+- **Semantic fill** (opt-in). The compiler embeds every chunk first,
+  averages each document's unit chunk vectors into a unit document vector,
+  and places documents in `ceil(chunks / shardTargetChunks)` shards by
+  balanced k-means over those vectors. The centres are seeded with the
+  k-means++ of §8.2 (seed = low 64 bits of
+  `SHA-256(catalogId || "#shard-fill" || 0x00 || "0")`). The compiler then
+  alternates two steps: a capacity-constrained assignment, and
+  chunk-weighted recentring. Each shard's capacity is an even split plus 2%. The
+  documents closest to one centre relative to the next choose first, and a
+  document whose nearest centre is full takes the nearest one with room.
+  Shards are numbered by their first document in `(topicPathKey,
+  documentId)` order.
+
+Topic fill separates documents that answer the same questions: an artist,
+their albums and their songs sit in different slices. Semantic fill keeps
+them together, so a routing budget of `S` shards reaches more of a query's
+neighbours. On a 1.85M-chunk Wikipedia music catalog (10 shards, 155
+queries, routed recall@8 against an exact scan), recall rose from 83% to
+86% at `S = 6` and from 52% to 64% at `S = 3`. With the same corpus cut
+into 37 shards, recall at `S = 6` rose from 36% to 56%. Neither assignment
+makes a catalog of dozens of shards fully routable at `S = 6`; such
+corpora are better published as several catalogs.
 
 ### 8.2 Centroids
 
@@ -528,6 +564,9 @@ A reader with several shards scores every centroid against the unit query
 vector (cosine), takes each shard's best score, and scans the top `S`
 shards; the reference implementation uses `S = 3` for proactive retrieval
 and `S = 6` for explicit search, sharing the budget across catalogs.
+A shard the router does not reach contributes nothing, so once a catalog
+has more shards than `S`, how its documents were assigned (§8.1) bounds
+semantic recall.
 Catalog-wide `fts_documents` search always runs regardless of routing, so
 exact-title recall never depends on it.
 
