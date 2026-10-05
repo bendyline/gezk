@@ -12,6 +12,7 @@ catalogs published under an earlier one point at.
 | --- | --- |
 | [`0.5/`](0.5/) | <https://bendyline.com/gezk/0.5/schemas/> |
 | [`0.6/`](0.6/) | <https://bendyline.com/gezk/0.6/schemas/> |
+| [`0.7/`](0.7/) | <https://bendyline.com/gezk/0.7/schemas/> |
 
-The current line is `0.6`. An earlier directory is frozen once its line
+The current line is `0.7`. An earlier directory is frozen once its line
 stops being written; the specification for each lives in `spec/`.

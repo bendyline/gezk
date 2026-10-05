@@ -1,4 +1,4 @@
-"""Reference reader for gezk knowledge catalogs (0.6, and 0.5 archives)."""
+"""Reference reader for gezk knowledge catalogs (draft 0.7, plus 0.6 and 0.5 archives)."""
 
 from .archive import (
     FORMAT_GENERATIONS,

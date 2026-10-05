@@ -17,7 +17,7 @@ MANIFEST_KIND = "gezk-catalog"
 # Each format version pairs with exactly one index schema; a manifest that
 # pairs them otherwise is corrupt (spec §1). The last entry is the current
 # line, the one a writer emits.
-FORMAT_GENERATIONS = {"0.5": 2, "0.6": 3}
+FORMAT_GENERATIONS = {"0.5": 2, "0.6": 3, "0.7": 4}
 SUPPORTED_FORMAT_VERSIONS = tuple(FORMAT_GENERATIONS)
 FORMAT_VERSION = SUPPORTED_FORMAT_VERSIONS[-1]
 MIMETYPE_PATH = "mimetype"

@@ -30,8 +30,8 @@ from .assets import (
 from .quantize import hamming_top_k, quantize_bits, rerank_score
 
 APPLICATION_ID = 0x47455A4B
-INDEX_SCHEMA_VERSION = 3
-SUPPORTED_INDEX_SCHEMA_VERSIONS = (2, 3)
+INDEX_SCHEMA_VERSION = 4
+SUPPORTED_INDEX_SCHEMA_VERSIONS = (2, 3, 4)
 MAX_DOCUMENT_BYTES = 16 * 1024 * 1024
 MAX_DOCUMENT_META_BYTES = 16 * 1024
 MAX_TOPIC_DEPTH = 16
@@ -176,7 +176,15 @@ class Catalog:
     def topics(self) -> list[dict]:
         """Every topic with its direct `document_count` and a
         `total_document_count` rolled up over its subtree. On a 0.5 catalog
-        every document sits at a root, so the two agree there."""
+        every document sits at a root, so the two agree there. Shared 0.7
+        placements count once per subtree, even across parent and child."""
+        rollup = (
+            "SELECT sub.root AS id, COUNT(DISTINCT td.document_id) AS total "
+            "FROM sub LEFT JOIN topic_documents td ON td.topic_id = sub.id GROUP BY sub.root"
+            if self.schema_version >= 4 else
+            "SELECT sub.root AS id, SUM(t.document_count) AS total "
+            "FROM sub JOIN topics t ON t.id = sub.id GROUP BY sub.root"
+        )
         rows = self.router.execute(
             f"""
             WITH RECURSIVE sub(root, id, depth) AS (
@@ -186,8 +194,7 @@ class Catalog:
               WHERE sub.depth < {TOPIC_WALK_MAX_DEPTH}
             ),
             rollup AS (
-              SELECT sub.root AS id, SUM(t.document_count) AS total
-              FROM sub JOIN topics t ON t.id = sub.id GROUP BY sub.root
+              {rollup}
             )
             SELECT t.id, t.parent_id, t.name, t.description, t.sort_key, t.document_count,
                    rollup.total AS total_document_count
@@ -197,8 +204,12 @@ class Catalog:
         )
         return [dict(row) for row in rows]
 
-    def _document_columns(self) -> str:
-        return _DOCUMENT_COLUMNS + (", ordinal, meta_json" if self.schema_version >= 3 else "")
+    def _document_columns(self, document: str = "", placement: str = "") -> str:
+        columns = (_DOCUMENT_COLUMNS + (", ordinal, meta_json" if self.schema_version >= 3 else "")).split(", ")
+        return ", ".join(
+            f"{placement if placement and column in ('topic_id', 'ordinal') else document}.{column} AS {column}"
+            if document else column for column in columns
+        )
 
     def _document_order(self) -> str:
         if self.schema_version >= 3:
@@ -216,6 +227,19 @@ class Catalog:
         if topic_id:
             return "", "WHERE topic_id = ?", [topic_id]
         return "", "", []
+
+    def _shared_scope(self, descendants: bool) -> str:
+        sub = "SELECT ?, 0"
+        if descendants:
+            sub += (
+                " UNION ALL SELECT t.id, sub.depth + 1 FROM topics t "
+                f"JOIN sub ON t.parent_id = sub.id WHERE sub.depth < {TOPIC_WALK_MAX_DEPTH}"
+            )
+        return f"""WITH RECURSIVE sub(id, depth) AS ({sub}), scoped AS (
+          SELECT td.document_id, td.topic_id, td.ordinal, t.sort_key
+          FROM topic_documents td JOIN topics t ON t.id = td.topic_id
+          WHERE td.topic_id IN (SELECT id FROM sub)
+        )"""
 
     def _document_from_row(self, row: sqlite3.Row) -> dict:
         doc = {k: row[k] for k in row.keys() if k not in ("body_codec", "body_blob", "meta_json")}
@@ -238,6 +262,11 @@ class Catalog:
         return meta
 
     def document_count(self, topic_id: Optional[str] = None, descendants: bool = True) -> int:
+        if self.schema_version >= 4 and topic_id:
+            return int(self.router.execute(
+                f"{self._shared_scope(descendants)} SELECT COUNT(DISTINCT document_id) FROM scoped",
+                [topic_id],
+            ).fetchone()[0])
         scope, where, params = self._topic_scope(topic_id, descendants)
         return int(self.router.execute(f"{scope} SELECT COUNT(*) FROM documents {where}", params).fetchone()[0])
 
@@ -250,7 +279,20 @@ class Catalog:
     ) -> list[dict]:
         """A page of documents, by default including those filed under the
         topic's descendants (`descendants=False` lists only its own). Ordered
-        documents (`ordinal`) come first, the rest by slug."""
+        documents (`ordinal`) come first, the rest by slug. Shared references
+        use the chosen placement metadata and deduplicate before pagination."""
+        if self.schema_version >= 4 and topic_id:
+            rows = self.router.execute(
+                f"""{self._shared_scope(descendants)}, ranked AS (
+                  SELECT *, ROW_NUMBER() OVER (PARTITION BY document_id
+                    ORDER BY (ordinal IS NULL), ordinal, sort_key, topic_id) AS placement_rank
+                  FROM scoped
+                ) SELECT {self._document_columns("d", "p")}
+                FROM documents d JOIN ranked p ON p.document_id = d.id AND p.placement_rank = 1
+                ORDER BY (p.ordinal IS NULL), p.ordinal, d.slug, d.id LIMIT ? OFFSET ?""",
+                [topic_id, limit, offset],
+            )
+            return [self._document_from_row(row) for row in rows]
         scope, where, params = self._topic_scope(topic_id, descendants)
         rows = self.router.execute(
             f"{scope} SELECT {self._document_columns()} FROM documents {where} "
@@ -443,7 +485,7 @@ class Catalog:
             f"router says format {self.format_version} / schema {self.schema_version}, "
             f"manifest says {m['formatVersion']} / {m['indexSchemaVersion']}",
         ))
-        topics = self.topics()
+        topics = [dict(row) for row in self.router.execute("SELECT * FROM topics")]
         checks.append(("toc-present", len(topics) >= 1, f"{len(topics)} topics"))
         checks.append(("topics-tree", *topic_tree_problem(topics)))
         undeclared = self.router.execute(
@@ -467,7 +509,11 @@ class Catalog:
             checks.append(("counts-assets", declared_count == len(asset_files), f"manifest counts {declared_count} assets, files declare {len(asset_files)}"))
         checks.append(("license-notice", any(f["path"] == m["license"]["noticePath"] for f in m["files"]), ""))
         total_docs = self.router.execute("SELECT COUNT(*) FROM documents").fetchone()[0]
-        checks.append(("counts-documents", total_docs == m["counts"]["documents"] and sum(t["document_count"] for t in topics) == total_docs, f"{total_docs}"))
+        checks.append(("counts-documents", total_docs == m["counts"]["documents"], f"{total_docs}"))
+        try:
+            checks.extend(self._toc_checks())
+        except sqlite3.DatabaseError as error:
+            checks.append(("toc-references", False, f"invalid TOC structure: {error}"))
         checks.append(("counts-shards", len(self.shards) == m["counts"]["shards"], f"{len(self.shards)}"))
         checks.append(("counts-chunks", sum(c for _, _, c in self.shards) == m["counts"]["chunks"], ""))
         if deep:
@@ -491,6 +537,40 @@ class Catalog:
                 top = [h.document_id for h in self.search_documents(smoke["query"], SMOKE_QUERY_TOP_N)]
                 missing = [d for d in smoke["expectedDocumentIds"] if d not in top]
                 checks.append((f"smoke:{smoke['query']}", not missing, ", ".join(missing)))
+        return checks
+
+    def _toc_checks(self) -> list[tuple[str, bool, str]]:
+        def count(sql: str) -> int:
+            return int(self.router.execute(sql).fetchone()[0])
+
+        relation = "topic_documents" if self.schema_version >= 4 else "documents"
+        incorrect = count(f"""
+            SELECT COUNT(*) FROM topics t LEFT JOIN
+            (SELECT topic_id, COUNT(*) AS n FROM {relation} GROUP BY topic_id) r ON r.topic_id = t.id
+            WHERE t.document_count != COALESCE(r.n, 0)
+        """)
+        checks = [("toc-counts", incorrect == 0, f"{incorrect} incorrect direct topic counts")]
+        if self.schema_version < 4:
+            return checks
+        invalid = count("""
+            SELECT COUNT(*) FROM topic_documents r
+            LEFT JOIN documents d ON d.id = r.document_id LEFT JOIN topics t ON t.id = r.topic_id
+            WHERE d.id IS NULL OR t.id IS NULL OR
+              (r.ordinal IS NOT NULL AND (typeof(r.ordinal) != 'integer' OR
+               r.ordinal < -2147483648 OR r.ordinal > 2147483647))
+        """)
+        missing = count("""
+            SELECT COUNT(*) FROM documents d WHERE NOT EXISTS (
+              SELECT 1 FROM topic_documents r WHERE r.document_id = d.id
+                AND r.topic_id = d.topic_id AND r.ordinal IS d.ordinal)
+        """)
+        duplicates = count("""
+            SELECT COUNT(*) FROM (SELECT topic_id, document_id FROM topic_documents
+              GROUP BY topic_id, document_id HAVING COUNT(*) > 1)
+        """)
+        checks.append(("toc-references", invalid == missing == duplicates == 0,
+                       f"{invalid} invalid references, {missing} missing/mismatched primary rows, "
+                       f"{duplicates} duplicate pairs"))
         return checks
 
     def _deep_checks_0_6(self, asset_files: list[dict]) -> list[tuple[str, bool, str]]:
