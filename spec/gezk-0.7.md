@@ -1,6 +1,6 @@
 # gezk 0.7 — Knowledge Catalog Format
 
-Status: **0.7, draft** (2026-10-04). Licensed CC BY 4.0 (see `LICENSE.md`).
+Status: **0.7, draft** (2026-10-05). Licensed CC BY 4.0 (see `LICENSE.md`).
 
 A gezk catalog is a versioned, read-only body of reference documents shipped
 as a single file, with everything a reader needs to browse, search and cite
@@ -14,6 +14,14 @@ The key words MUST, MUST NOT, SHOULD and MAY are to be interpreted as in
 RFC 2119.
 
 **Changes since 0.6:**
+
+- Index schema 4 also adds portable document point locations in
+  `document_locations`, and a required manifest `spatial` summary. Locations
+  describe document subjects separately from associated places (§5.2.2).
+- Radius discovery and spatially constrained lexical/semantic retrieval have
+  shared distance, deduplication and pagination semantics (§5.2.2).
+- This remains the unpublished 0.7 draft; pre-location 0.7 draft fixtures
+  must be regenerated. Published 0.5 and 0.6 layouts remain unchanged.
 
 - Index schema 4 adds shared TOC references in the router table
   `topic_documents`: one canonical document can appear under several topics
@@ -170,6 +178,11 @@ SHOULD send `X-Content-Type-Options: nosniff` and, for SVG, a sandboxing
   },
   "counts": { "documents": 57210, "chunks": 199481, "shards": 1, "assets": 0 },
   "files": [ { "path": "index/router.db", "sizeBytes": 123, "sha256": "…" }, … ],
+  "spatial": {
+    "schema": "document-points@1", "crs": "EPSG:4326",
+    "distanceModel": "sphere-6371000",
+    "locationCount": 0, "locatedDocuments": 0, "coverage": []
+  },
   "requires": { "formatVersion": "0.7", "features": [] },
   "smokeQueries": [ { "query": "Newton's laws of motion", "expectedDocumentIds": ["…"] } ],
   "toolchain": { "name": "@bendyline/gezel-knowledge", "version": "1.1.0" },
@@ -247,6 +260,18 @@ CREATE TABLE documents(
 );
 CREATE INDEX documents_topic ON documents(topic_id, ordinal, slug);
 CREATE INDEX documents_shard ON documents(shard_id);
+
+CREATE TABLE document_locations(
+  document_id TEXT NOT NULL REFERENCES documents(id),
+  location_id TEXT NOT NULL,
+  latitude REAL NOT NULL CHECK (latitude BETWEEN -90 AND 90),
+  longitude REAL NOT NULL CHECK (longitude >= -180 AND longitude < 180),
+  role TEXT NOT NULL CHECK (role IN ('subject','associated')),
+  provenance_json TEXT,
+  PRIMARY KEY (document_id, location_id)
+) WITHOUT ROWID;
+CREATE INDEX document_locations_latitude ON document_locations(latitude, longitude, document_id);
+CREATE INDEX document_locations_longitude ON document_locations(longitude, latitude, document_id);
 
 CREATE TABLE topic_documents(
   topic_id TEXT NOT NULL REFERENCES topics(id),
@@ -358,6 +383,117 @@ rejects repeated leaf topics, including a reference to the primary leaf;
 it emits one `topic_documents` row per placement. Reference input order
 does not change the archive. The body and canonical title are shared; no
 per-placement title or redirect document is introduced.
+
+### 5.2.2 Document locations and radius queries
+
+Every 0.7 router MUST contain `document_locations`, including catalogs with
+no location data. Compiler input MAY supply `locations`, at most 256 points
+per document. Missing or empty locations mean unknown location. The compiler
+MUST reject invalid coordinates, repeated location IDs and invalid roles.
+Input order MUST NOT change the archive; rows are inserted in document and
+location ID order. Location metadata MUST NOT alter passage text, chunk IDs
+or embedding-cache keys.
+
+```json
+{
+  "locations": [
+    { "id": "qualla-article-seattle-wp", "latitude": 47.6062,
+      "longitude": -122.3321, "role": "subject",
+      "provenance": { "source": "qualla-article", "articleId": "seattle-wp" } }
+  ]
+}
+```
+
+Each `location_id` follows the document ID grammar (1–256, NFC, trimmed, no
+C0/C1 controls), unique within that document and stable across rebuilds.
+Coordinates are finite WGS84 decimal degrees: latitude in [-90,90], input
+longitude in [-180,180]. Writers MUST normalize +180 to -180 and negative
+zero to zero; stored longitudes are in [-180,180). Named fields avoid axis
+order ambiguity. If exporting GeoJSON, its coordinate order is longitude,
+latitude ([RFC 7946](https://www.rfc-editor.org/rfc/rfc7946)).
+
+`subject` means the document describes the place at that point. `associated`
+means a related place (for example an author's birthplace); it MUST NOT
+qualify a document for subject radius queries. Multiple subjects are allowed.
+A city, river or park represented by a point is an anchor, not a polygon:
+the query makes no claim that an area's extent intersects the circle.
+There is no inferred coordinate from a region name, topic path or arbitrary
+opaque document `meta`. Producers SHOULD record why a point was chosen.
+`provenance_json` is absent or a UTF-8 JSON object, at most 16,384 bytes;
+applications MUST treat its contents as untrusted producer data.
+
+The manifest MUST carry `spatial` with exactly these fields:
+
+| Field | Meaning |
+| --- | --- |
+| `schema` | `document-points@1` |
+| `crs` | `EPSG:4326` (named latitude/longitude in degrees) |
+| `distanceModel` | `sphere-6371000` |
+| `locationCount` | All point rows, including associated points |
+| `locatedDocuments` | Distinct documents with any point row |
+| `coverage` | Zero, one or two non-wrapping subject-point bounds |
+
+Bounds are `{west,south,east,north}`. Coverage is the minimal longitudinal
+arc around all subject points, with minimum/maximum latitude. Sort unique
+normalized longitudes ascending, find the largest gap including the wrap
+gap, choose its complement; on tied gaps choose the first in that ascending
+scan. Split a wrapping arc at ±180 into two bounds, western-positive part
+first. No subject points yield `[]`; associated points do not enlarge it.
+Counts and coverage MUST be recomputed and reconciled during validation.
+Coverage is for discovery; readers MUST NOT use it to assert point membership
+or omit unknown/legacy catalogs from an otherwise authorized search.
+
+A radius request is `{latitude,longitude,radiusMeters}`. All values MUST be
+finite; coordinates have the ranges above and radius MUST be nonnegative.
+Use a sphere of radius 6,371,000 metres. In radians, the normative distance is:
+
+```
+a = sin²((lat2-lat1)/2) + cos(lat1)*cos(lat2)*sin²((lon2-lon1)/2)
+a = clamp(a, 0, 1)
+d = 2 * 6371000 * atan2(sqrt(a), sqrt(1-a))
+```
+
+Equivalent ±180 longitudes and identical poles have distance zero.
+A subject point matches iff `d <= radiusMeters`. Unrounded distance controls
+membership and sorting; round only for display. A radius of zero is valid;
+a radius at least π times the sphere radius includes every subject point.
+Conservative bounding-box candidates MAY accelerate this predicate. They
+MUST include boundary points, handle date-line splits and all longitudes when
+the circle contains a pole. No R-tree, H3 or other SQLite extension is
+required. An R-tree MAY be a rebuildable reader cache; its float32 bounds
+MUST NOT become the authoritative coordinates
+([SQLite R-tree documentation](https://www.sqlite.org/rtree.html)).
+
+Text-free discovery MUST deduplicate documents before counting/pagination,
+use the nearest matching subject, break equal-anchor ties by location ID,
+and order by unrounded distance then document ID within one catalog.
+Return `distanceMeters` and `matchedLocation` with each result. Across
+catalogs, product APIs MUST apply authorization/enabled/catalog filters
+first and MUST define publisher-aware source deduplication before pagination.
+Opaque cursors SHOULD bind the radius, authorized catalog identities and
+versions/digests so changed scope or snapshots invalidate continuation.
+
+For a radius plus text query, compute eligible documents before title FTS,
+chunk FTS and semantic candidate selection. Limits, per-catalog caps and
+centroid routing MUST NOT discard eligible documents merely because closer
+semantic neighbours are outside the circle. Route all shards containing
+eligible documents, mask noneligible chunks before stage-1 top-K, then rerank
+and fuse eligible hits. Relevance remains primary; distance is available as
+an optional tie-breaker. Empty eligibility returns no hits.
+
+Older 0.5/0.6 archives remain valid and lack this table. A reader MAY expose
+an explicitly named producer adapter, never a generic guess at opaque
+metadata. Gezel's `qualla-regional-meta@1` adapter recognizes 0.6 Qualla
+regional documents' `meta.coordinates.{lat,lng}`, `meta.region` and
+`meta.quallaArticleIds`, validates the point and exposes a single subject
+anchor. It cannot recover extra anchors discarded by that historical writer.
+
+A companion export SHOULD include `document-locations.parquet` with
+`document_id`, `location_id`, `latitude`, `longitude`, `role`, and nullable
+`provenance_json`; join by document ID without copying embeddings per point.
+Gezel export version 4 emits this table for 0.7, including zero rows, and
+for older archives when an explicit adapter yields points. Point coordinates
+are double precision and all files appear in the export's checksummed report.
 
 ### 5.3 Shard databases
 

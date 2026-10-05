@@ -83,3 +83,13 @@ Semantic search takes a unit query vector you produce with the catalog's
 embedding profile (the manifest names the Hugging Face model and revision);
 `gezk.hashembed` implements the deterministic stand-in the conformance kit
 uses. This package is held to `conformance/` in CI.
+
+
+The 0.7 draft includes typed document subject/associated point locations, a
+manifest spatial summary, and radius discovery with `sphere-6371000` distances.
+See [the 0.7 specification](../../spec/gezk-0.7.md).
+
+`catalog.nearby_documents({"latitude": 47.6062, "longitude": -122.3321, "radiusMeters": 50000})`
+returns documents, total, nearest matching subject and unrounded metre distances.
+`search_documents`, `search_chunks` and `search_semantic` accept the same radius
+as the optional `spatial` argument and constrain candidates before their limits.

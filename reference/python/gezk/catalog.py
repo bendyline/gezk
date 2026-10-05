@@ -15,6 +15,7 @@ from typing import Optional
 import brotli
 
 from .archive import GezkError
+from .spatial import validate_radius, validate_location, distance_meters, radius_bounds, spatial_manifest
 from .assets import (
     MAX_ASSET_BYTES,
     MAX_ASSET_COUNT,
@@ -249,6 +250,8 @@ class Catalog:
         else:
             doc["ordinal"] = None
             doc["meta"] = None
+        locations = self.document_locations(doc["id"])
+        if locations: doc["locations"] = locations
         return doc
 
     @staticmethod
@@ -370,22 +373,72 @@ class Catalog:
             raise GezkError(f"asset size differs from the manifest: {path}", "corrupt")
         return {**info, "bytes": data}
 
+    def _location_rows(self, document_id=None):
+        table = self.router.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='document_locations'").fetchone()
+        if table:
+            result = []
+            for row in self.router.execute("SELECT * FROM document_locations" + (" WHERE document_id = ?" if document_id is not None else "") + " ORDER BY document_id, location_id", [document_id] if document_id is not None else []):
+                point = {"id": row["location_id"], "latitude": row["latitude"], "longitude": row["longitude"], "role": row["role"]}
+                if row["provenance_json"] is not None:
+                    if len(row["provenance_json"].encode("utf8")) > 16384: raise ValueError("location provenance exceeds 16384 bytes")
+                    point["provenance"] = json.loads(row["provenance_json"])
+                result.append((row["document_id"], validate_location(point)))
+            return result
+        result = []
+        if self.schema_version != 3: return result
+        for row in self.router.execute("SELECT id, meta_json FROM documents WHERE id LIKE 'qualla-%' AND meta_json IS NOT NULL"):
+            try:
+                meta = json.loads(row["meta_json"])
+                if not isinstance(meta.get("region"), str) or not isinstance(meta.get("quallaArticleIds"), list): continue
+                point = validate_location({"id": "qualla-coordinate", "role": "subject", "latitude": meta["coordinates"]["lat"], "longitude": meta["coordinates"]["lng"], "provenance": {"adapter": "qualla-regional-meta@1", "articleIds": meta["quallaArticleIds"]}})
+                if point["longitude"] == 180: point["longitude"] = -180
+                result.append((row["id"], point))
+            except (ValueError, TypeError, KeyError): pass
+        return result
+
+    def document_locations(self, document_id):
+        return [point for ident, point in self._location_rows(document_id) if ident == document_id]
+
+    def spatial_matches(self, radius):
+        validate_radius(radius)
+        matches = {}
+        for ident, point in self._location_rows():
+            if point["role"] != "subject": continue
+            distance = distance_meters(radius, point)
+            if distance > radius["radiusMeters"]: continue
+            previous = matches.get(ident)
+            if previous is None or (distance, point["id"]) < (previous["distanceMeters"], previous["matchedLocation"]["id"]):
+                matches[ident] = {"distanceMeters": distance, "matchedLocation": point}
+        return matches
+
+    def nearby_documents(self, radius, offset=0, limit=50):
+        matches = sorted(self.spatial_matches(radius).items(), key=lambda item: (item[1]["distanceMeters"], item[0]))
+        documents = []
+        for ident, match in matches[max(0, offset):max(0, offset) + min(500, max(1, limit))]:
+            row = self.router.execute(f"SELECT {self._document_columns()} FROM documents WHERE id = ?", [ident]).fetchone()
+            documents.append({**self._document_from_row(row), **match})
+        return {"documents": documents, "total": len(matches)}
+
     # ── search ────────────────────────────────────────────────────────────
-    def search_documents(self, query: str, limit: int = 10) -> list[DocumentHit]:
+    def search_documents(self, query: str, limit: int = 10, spatial: Optional[dict] = None) -> list[DocumentHit]:
         match = sanitize_fts_query(query)
         if not match:
             return []
+        scope = json.dumps(list(self.spatial_matches(spatial))) if spatial is not None else None
+        predicate = " AND f.document_id IN (SELECT value FROM json_each(?))" if scope is not None else ""
         rows = self.router.execute(
             "SELECT f.document_id, d.title FROM fts_documents f JOIN documents d ON d.id = f.document_id "
-            "WHERE fts_documents MATCH ? ORDER BY f.rank LIMIT ?",
-            [match, limit],
+            "WHERE fts_documents MATCH ?" + predicate + " ORDER BY f.rank LIMIT ?",
+            [match, scope, limit] if scope is not None else [match, limit],
         )
         return [DocumentHit(row["document_id"], row["title"], i) for i, row in enumerate(rows)]
 
-    def search_chunks(self, query: str, shard_ids: Optional[Sequence[int]] = None, limit_per_shard: int = 12) -> list[ChunkHit]:
+    def search_chunks(self, query: str, shard_ids: Optional[Sequence[int]] = None, limit_per_shard: int = 12, spatial: Optional[dict] = None) -> list[ChunkHit]:
         match = sanitize_fts_query(query)
         if not match:
             return []
+        scope = json.dumps(list(self.spatial_matches(spatial))) if spatial is not None else None
+        predicate = " AND c.document_id IN (SELECT value FROM json_each(?))" if scope is not None else ""
         hits: list[ChunkHit] = []
         for shard_id, path, _ in self.shards:
             if shard_ids is not None and shard_id not in shard_ids:
@@ -393,8 +446,8 @@ class Catalog:
             db = self._shard_db(path)
             rows = db.execute(
                 "SELECT c.chunk_uid, c.document_id, c.title, c.heading_path, c.line_start, c.line_end, c.text "
-                "FROM fts_chunks f JOIN chunks c ON c.id = f.rowid WHERE fts_chunks MATCH ? ORDER BY f.rank LIMIT ?",
-                [match, limit_per_shard],
+                "FROM fts_chunks f JOIN chunks c ON c.id = f.rowid WHERE fts_chunks MATCH ?" + predicate + " ORDER BY f.rank LIMIT ?",
+                [match, scope, limit_per_shard] if scope is not None else [match, limit_per_shard],
             )
             for row in rows:
                 hits.append(
@@ -438,13 +491,18 @@ class Catalog:
         scores = self.score_shards(query)
         return [shard_id for shard_id, _ in sorted(scores.items(), key=lambda kv: -kv[1])[:budget]]
 
-    def search_semantic(self, query: Sequence[float], final_k: int = 24, shard_budget: int = 6) -> list[ChunkHit]:
+    def search_semantic(self, query: Sequence[float], final_k: int = 24, shard_budget: int = 6, spatial: Optional[dict] = None) -> list[ChunkHit]:
         query_bits = quantize_bits(query)
         hits: list[ChunkHit] = []
-        for shard_id in self.route_shards(query, shard_budget):
+        allowed = set(self.spatial_matches(spatial)) if spatial is not None else None
+        routed = self.route_shards(query, shard_budget) if allowed is None else [int(row[0]) for row in self.router.execute("SELECT DISTINCT shard_id FROM documents WHERE id IN (SELECT value FROM json_each(?))", [json.dumps(list(allowed))])]
+        for shard_id in routed:
             path, chunk_count = next((p, c) for sid, p, c in self.shards if sid == shard_id)
             db = self._shard_db(path)
-            candidates = hamming_top_k(self.shard_bits(path), ceil(self.dimensions / 8), query_bits, rerank_k(final_k, chunk_count))
+            candidates = hamming_top_k(self.shard_bits(path), ceil(self.dimensions / 8), query_bits, chunk_count if allowed is not None else rerank_k(final_k, chunk_count))
+            if allowed is not None:
+                eligible = {int(row[0]) for row in db.execute("SELECT id FROM chunks WHERE document_id IN (SELECT value FROM json_each(?))", [json.dumps(list(allowed))])}
+                candidates = [hit for hit in candidates if hit[0] in eligible][:rerank_k(final_k, len(eligible))]
             scored = []
             for chunk_id, _ in candidates:
                 row = db.execute("SELECT v FROM chunk_vectors_int8 WHERE chunk_id = ?", [chunk_id]).fetchone()
@@ -485,6 +543,19 @@ class Catalog:
             f"router says format {self.format_version} / schema {self.schema_version}, "
             f"manifest says {m['formatVersion']} / {m['indexSchemaVersion']}",
         ))
+        if m["formatVersion"] == "0.7":
+            try:
+                has_table = self.router.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='document_locations'").fetchone() is not None
+                checks.append(("document-locations-table", has_table, ""))
+                rows = self._location_rows()
+                grouped = {}
+                for ident, point in rows:
+                    if not self.router.execute("SELECT 1 FROM documents WHERE id = ?", [ident]).fetchone(): raise ValueError("location references missing document")
+                    if point["longitude"] == 180: raise ValueError("longitude must be normalized")
+                    grouped.setdefault(ident, []).append(point["id"])
+                if any(len(ids) > 256 or len(ids) != len(set(ids)) for ids in grouped.values()): raise ValueError("invalid location ids or count")
+                checks.append(("document-locations-summary", spatial_manifest(rows) == m.get("spatial"), ""))
+            except (ValueError, sqlite3.DatabaseError) as err: checks.append(("document-locations-integrity", False, str(err)))
         topics = [dict(row) for row in self.router.execute("SELECT * FROM topics")]
         checks.append(("toc-present", len(topics) >= 1, f"{len(topics)} topics"))
         checks.append(("topics-tree", *topic_tree_problem(topics)))

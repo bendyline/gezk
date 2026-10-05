@@ -10,7 +10,8 @@ read, so it is not tied to gezel or to any vector-database extension.
 release may change it incompatibly, and a reader supports exactly the
 versions it names. Catalogs published under a line stay readable by readers
 of that line forever. 0.7 adds shared TOC placements with one canonical
-article body; the reference readers also open 0.5 and 0.6.
+article body, typed subject/associated point locations, and radius discovery
+with `sphere-6371000` distances. The reference readers also open 0.5 and 0.6.
 
 ## What is inside a catalog
 
@@ -23,7 +24,7 @@ physics-en-2026.9.1.gezk           a ZIP whose first entry is the stored magic
 ├── LICENSES/source-notices.json   per-source attribution (optional)
 ├── assets/…                       images the document bodies reference (optional)
 └── index/
-    ├── router.db                  topics, document directory, full bodies, routing centroids
+    ├── router.db                  topics, document directory, full bodies, point locations, routing centroids
     └── shards/000.db …            chunks, FTS5, sign-bit + int8 vectors (plain BLOB tables)
 ```
 
