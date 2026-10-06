@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sqlite3
 import zipfile
 from pathlib import Path
 
@@ -221,9 +222,7 @@ def test_asset_rules():
 
 @pytest.mark.parametrize("facts", [pytest.param(entry, id=f"gezk-{entry['formatVersion']}") for entry in LEGACY])
 def test_legacy_fixture_reads_under_its_generation_rules(facts, tmp_path):
-    """A 0.6 reader still opens the earlier generation's fixture: the newer
-    columns read as absent, no assets exist, and every rollup equals the
-    direct count because that generation filed every document at a root."""
+    """Older fixtures retain their own version-specific browse and asset rules."""
     path = KIT / facts["path"]
     data = path.read_bytes()
     assert len(data) == facts["sizeBytes"] and hashlib.sha256(data).hexdigest() == facts["sha256"]
@@ -236,11 +235,20 @@ def test_legacy_fixture_reads_under_its_generation_rules(facts, tmp_path):
     try:
         assert cat.schema_version == FORMAT_GENERATIONS[facts["formatVersion"]]
         _assert_fixture_facts(cat, facts)
-        assert cat.assets() == [] and cat.read_asset("assets/mark.png") is None
-        assert all(t["total_document_count"] == t["document_count"] for t in cat.topics())
         docs = cat.documents(limit=1000)
         assert len(docs) == facts["documents"]
-        assert all(d["ordinal"] is None and d["meta"] is None for d in docs)
+        if facts["formatVersion"] == "0.5":
+            assert cat.assets() == [] and cat.read_asset("assets/mark.png") is None
+            assert all(t["total_document_count"] == t["document_count"] for t in cat.topics())
+            assert all(d["ordinal"] is None and d["meta"] is None for d in docs)
+        else:
+            nested = facts["nestedTopic"]
+            assert cat.document_count(nested["parentId"]) == nested["parentTotalDocuments"]
+            assert cat.document_count(nested["id"], descendants=False) == nested["directDocuments"]
+            order = facts["orderedListing"]
+            assert [d["id"] for d in cat.documents(order["topicId"], limit=5)] == order["firstDocumentIds"]
+            assert cat.get_document(facts["metaSample"]["documentId"])["meta"] == facts["metaSample"]["meta"]
+            assert cat.assets() == facts["assets"]
     finally:
         cat.close()
 
@@ -361,3 +369,76 @@ def test_unverifiable_signature_fails_when_a_check_was_asked_for(tmp_path, monke
     assert cli.main(["verify", str(FIXTURE), "--anchors", str(anchors_file)]) == 1
     # Without anchors nothing was asked for, so the same install still passes.
     assert cli.main(["verify", str(FIXTURE)]) == 0
+
+
+def test_shared_toc_references(catalog):
+    shared = VECTORS["fixture"]["sharedToc"]
+    document_id = shared["documentId"]
+    canonical = catalog.get_document(document_id)
+    assert canonical["topic_id"] == shared["primaryTopicId"]
+    assert catalog.document_count() == VECTORS["fixture"]["documents"]
+    assert sum(t["document_count"] for t in catalog.topics()) == VECTORS["fixture"]["documents"] + 2
+    for topic_id, ordinal in zip(shared["referenceTopicIds"], [-5, -4]):
+        rows = catalog.documents(topic_id, limit=1000, descendants=False)
+        doc = next(d for d in rows if d["id"] == document_id)
+        assert doc["topic_id"] == topic_id and doc["ordinal"] == ordinal
+        assert doc["title"] == canonical["title"]
+    # A primary placement at craft and a reference below craft count once.
+    rows = catalog.documents("craft", limit=1000)
+    assert len(rows) == catalog.document_count("craft") == 27
+    assert len({d["id"] for d in rows}) == len(rows)
+    chosen = next(d for d in rows if d["id"] == document_id)
+    assert (chosen["topic_id"], chosen["ordinal"]) == ("metals", -4)
+    pages = [d for offset in range(0, len(rows), 3)
+             for d in catalog.documents("craft", limit=3, offset=offset)]
+    assert pages == rows
+    assert catalog.document_count("unknown") == 0 and catalog.documents("unknown") == []
+    assert sum(d["id"] == document_id for d in catalog.documents(limit=1000)) == 1
+    assert sum(h.document_id == document_id for h in catalog.search_documents(canonical["title"], 40)) == 1
+    assert catalog.get_document(document_id) == canonical
+
+
+@pytest.mark.parametrize("sql,check", [
+    ("DELETE FROM topic_documents WHERE document_id='doc-0000' AND topic_id='craft'", "toc-references"),
+    ("UPDATE topic_documents SET ordinal=99 WHERE document_id='doc-0000' AND topic_id='craft'", "toc-references"),
+    ("UPDATE topic_documents SET ordinal=2147483648 WHERE document_id='doc-0000' AND topic_id='nature'", "toc-references"),
+    ("UPDATE topic_documents SET ordinal=1.5 WHERE document_id='doc-0000' AND topic_id='nature'", "toc-references"),
+    ("UPDATE topic_documents SET topic_id='missing' WHERE document_id='doc-0000' AND topic_id='nature'", "toc-references"),
+    ("INSERT INTO topic_documents VALUES ('nature', 'missing', NULL)", "toc-references"),
+    ("UPDATE topics SET document_count=document_count+1 WHERE id='nature'", "toc-counts"),
+    ("DROP TABLE topic_documents", "toc-references"),
+    ("""CREATE TABLE broken AS SELECT * FROM topic_documents;
+        INSERT INTO broken SELECT * FROM topic_documents WHERE document_id='doc-0000';
+        DROP TABLE topic_documents; ALTER TABLE broken RENAME TO topic_documents;""", "toc-references"),
+])
+def test_invalid_shared_toc_is_rejected(tmp_path, sql, check):
+    root = tmp_path / "invalid"
+    verify_and_extract(FIXTURE, root, ANCHORS)
+    with sqlite3.connect(root / "index/router.db") as db:
+        db.executescript("PRAGMA ignore_check_constraints=ON;\n" + sql)
+    cat = Catalog(root)
+    try:
+        failures = {name for name, ok, _ in cat.validate() if not ok}
+        assert check in failures
+    finally:
+        cat.close()
+
+
+def test_shared_toc_selection_ties_and_empty_topics(tmp_path):
+    root = tmp_path / "ties"
+    verify_and_extract(FIXTURE, root, ANCHORS)
+    with sqlite3.connect(root / "index/router.db") as db:
+        # Equal ordinals resolve by sort key, then by topic ID.
+        db.execute("UPDATE topic_documents SET ordinal=7 WHERE document_id='doc-0000'")
+        db.execute("UPDATE documents SET ordinal=7 WHERE id='doc-0000'")
+        db.execute("UPDATE topics SET sort_key='same' WHERE id IN ('craft', 'metals')")
+        db.execute("INSERT INTO topics VALUES ('empty', 'craft', 'Empty', NULL, 'last', 0)")
+    cat = Catalog(root)
+    try:
+        shared = next(d for d in cat.documents("craft", limit=1000) if d["id"] == "doc-0000")
+        assert shared["topic_id"] == "craft" and shared["ordinal"] == 7
+        empty = next(t for t in cat.topics() if t["id"] == "empty")
+        assert empty["document_count"] == empty["total_document_count"] == 0
+        assert cat.document_count("empty") == 0 and cat.documents("empty") == []
+    finally:
+        cat.close()

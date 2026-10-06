@@ -4,8 +4,8 @@ A small, dependency-light reader for `.gezk` knowledge catalogs: verify an
 archive, browse its table of contents, read documents and their assets, run
 full-text and two-stage semantic search, and format `knowledge://` citations.
 Standard library plus `brotli` (document bodies); Ed25519 signature
-verification needs the `signing` extra (`cryptography`). It reads gezk 0.6
-catalogs and the 0.5 archives published before it (spec §1).
+verification needs the `signing` extra (`cryptography`). It reads draft gezk
+0.7 catalogs and the 0.5 and 0.6 archives published before it (spec §1).
 
 ## Install from this repository
 
@@ -46,6 +46,7 @@ verifies end to end without any other file:
 
 ```bash
 python -c "import json,sys; json.dump([json.load(open('conformance/vectors.json'))['signature']], sys.stdout)" > anchors.json
+gezk verify conformance/fixtures/conformance-0.7.gezk --deep --anchors anchors.json
 gezk verify conformance/fixtures/conformance-0.6.gezk --deep --anchors anchors.json
 gezk verify conformance/fixtures/conformance-0.5.gezk --deep --anchors anchors.json
 ```
@@ -71,10 +72,24 @@ png = cat.read_asset("assets/figures/pendulum.png")
 `topics()` reports each topic's own documents and the total across its
 subtree; `documents(topic_id)` lists the subtree by default (ordered
 documents first, then by slug) and `descendants=False` narrows it to the
-topic itself. Assets are the images a body references by archive path;
+topic itself. In 0.7, an article may appear in several topics; subtree
+counts and pages contain each canonical document once. Scoped rows return the
+chosen placement’s `topic_id` and `ordinal`; `get_document(id)` and unscoped
+listings return its primary placement. The body and citation stay the same.
+Assets are the images a body references by archive path;
 `read_asset` hands back the bytes the manifest declared, or `None`.
 
 Semantic search takes a unit query vector you produce with the catalog's
 embedding profile (the manifest names the Hugging Face model and revision);
 `gezk.hashembed` implements the deterministic stand-in the conformance kit
 uses. This package is held to `conformance/` in CI.
+
+
+The 0.7 draft includes typed document subject/associated point locations, a
+manifest spatial summary, and radius discovery with `sphere-6371000` distances.
+See [the 0.7 specification](../../spec/gezk-0.7.md).
+
+`catalog.nearby_documents({"latitude": 47.6062, "longitude": -122.3321, "radiusMeters": 50000})`
+returns documents, total, nearest matching subject and unrounded metre distances.
+`search_documents`, `search_chunks` and `search_semantic` accept the same radius
+as the optional `spatial` argument and constrain candidates before their limits.

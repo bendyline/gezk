@@ -15,6 +15,7 @@ from typing import Optional
 import brotli
 
 from .archive import GezkError
+from .spatial import validate_radius, validate_location, distance_meters, radius_bounds, spatial_manifest
 from .assets import (
     MAX_ASSET_BYTES,
     MAX_ASSET_COUNT,
@@ -30,8 +31,8 @@ from .assets import (
 from .quantize import hamming_top_k, quantize_bits, rerank_score
 
 APPLICATION_ID = 0x47455A4B
-INDEX_SCHEMA_VERSION = 3
-SUPPORTED_INDEX_SCHEMA_VERSIONS = (2, 3)
+INDEX_SCHEMA_VERSION = 4
+SUPPORTED_INDEX_SCHEMA_VERSIONS = (2, 3, 4)
 MAX_DOCUMENT_BYTES = 16 * 1024 * 1024
 MAX_DOCUMENT_META_BYTES = 16 * 1024
 MAX_TOPIC_DEPTH = 16
@@ -176,7 +177,15 @@ class Catalog:
     def topics(self) -> list[dict]:
         """Every topic with its direct `document_count` and a
         `total_document_count` rolled up over its subtree. On a 0.5 catalog
-        every document sits at a root, so the two agree there."""
+        every document sits at a root, so the two agree there. Shared 0.7
+        placements count once per subtree, even across parent and child."""
+        rollup = (
+            "SELECT sub.root AS id, COUNT(DISTINCT td.document_id) AS total "
+            "FROM sub LEFT JOIN topic_documents td ON td.topic_id = sub.id GROUP BY sub.root"
+            if self.schema_version >= 4 else
+            "SELECT sub.root AS id, SUM(t.document_count) AS total "
+            "FROM sub JOIN topics t ON t.id = sub.id GROUP BY sub.root"
+        )
         rows = self.router.execute(
             f"""
             WITH RECURSIVE sub(root, id, depth) AS (
@@ -186,8 +195,7 @@ class Catalog:
               WHERE sub.depth < {TOPIC_WALK_MAX_DEPTH}
             ),
             rollup AS (
-              SELECT sub.root AS id, SUM(t.document_count) AS total
-              FROM sub JOIN topics t ON t.id = sub.id GROUP BY sub.root
+              {rollup}
             )
             SELECT t.id, t.parent_id, t.name, t.description, t.sort_key, t.document_count,
                    rollup.total AS total_document_count
@@ -197,8 +205,12 @@ class Catalog:
         )
         return [dict(row) for row in rows]
 
-    def _document_columns(self) -> str:
-        return _DOCUMENT_COLUMNS + (", ordinal, meta_json" if self.schema_version >= 3 else "")
+    def _document_columns(self, document: str = "", placement: str = "") -> str:
+        columns = (_DOCUMENT_COLUMNS + (", ordinal, meta_json" if self.schema_version >= 3 else "")).split(", ")
+        return ", ".join(
+            f"{placement if placement and column in ('topic_id', 'ordinal') else document}.{column} AS {column}"
+            if document else column for column in columns
+        )
 
     def _document_order(self) -> str:
         if self.schema_version >= 3:
@@ -217,6 +229,19 @@ class Catalog:
             return "", "WHERE topic_id = ?", [topic_id]
         return "", "", []
 
+    def _shared_scope(self, descendants: bool) -> str:
+        sub = "SELECT ?, 0"
+        if descendants:
+            sub += (
+                " UNION ALL SELECT t.id, sub.depth + 1 FROM topics t "
+                f"JOIN sub ON t.parent_id = sub.id WHERE sub.depth < {TOPIC_WALK_MAX_DEPTH}"
+            )
+        return f"""WITH RECURSIVE sub(id, depth) AS ({sub}), scoped AS (
+          SELECT td.document_id, td.topic_id, td.ordinal, t.sort_key
+          FROM topic_documents td JOIN topics t ON t.id = td.topic_id
+          WHERE td.topic_id IN (SELECT id FROM sub)
+        )"""
+
     def _document_from_row(self, row: sqlite3.Row) -> dict:
         doc = {k: row[k] for k in row.keys() if k not in ("body_codec", "body_blob", "meta_json")}
         if self.schema_version >= 3:
@@ -225,6 +250,8 @@ class Catalog:
         else:
             doc["ordinal"] = None
             doc["meta"] = None
+        locations = self.document_locations(doc["id"])
+        if locations: doc["locations"] = locations
         return doc
 
     @staticmethod
@@ -238,6 +265,11 @@ class Catalog:
         return meta
 
     def document_count(self, topic_id: Optional[str] = None, descendants: bool = True) -> int:
+        if self.schema_version >= 4 and topic_id:
+            return int(self.router.execute(
+                f"{self._shared_scope(descendants)} SELECT COUNT(DISTINCT document_id) FROM scoped",
+                [topic_id],
+            ).fetchone()[0])
         scope, where, params = self._topic_scope(topic_id, descendants)
         return int(self.router.execute(f"{scope} SELECT COUNT(*) FROM documents {where}", params).fetchone()[0])
 
@@ -250,7 +282,20 @@ class Catalog:
     ) -> list[dict]:
         """A page of documents, by default including those filed under the
         topic's descendants (`descendants=False` lists only its own). Ordered
-        documents (`ordinal`) come first, the rest by slug."""
+        documents (`ordinal`) come first, the rest by slug. Shared references
+        use the chosen placement metadata and deduplicate before pagination."""
+        if self.schema_version >= 4 and topic_id:
+            rows = self.router.execute(
+                f"""{self._shared_scope(descendants)}, ranked AS (
+                  SELECT *, ROW_NUMBER() OVER (PARTITION BY document_id
+                    ORDER BY (ordinal IS NULL), ordinal, sort_key, topic_id) AS placement_rank
+                  FROM scoped
+                ) SELECT {self._document_columns("d", "p")}
+                FROM documents d JOIN ranked p ON p.document_id = d.id AND p.placement_rank = 1
+                ORDER BY (p.ordinal IS NULL), p.ordinal, d.slug, d.id LIMIT ? OFFSET ?""",
+                [topic_id, limit, offset],
+            )
+            return [self._document_from_row(row) for row in rows]
         scope, where, params = self._topic_scope(topic_id, descendants)
         rows = self.router.execute(
             f"{scope} SELECT {self._document_columns()} FROM documents {where} "
@@ -328,22 +373,72 @@ class Catalog:
             raise GezkError(f"asset size differs from the manifest: {path}", "corrupt")
         return {**info, "bytes": data}
 
+    def _location_rows(self, document_id=None):
+        table = self.router.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='document_locations'").fetchone()
+        if table:
+            result = []
+            for row in self.router.execute("SELECT * FROM document_locations" + (" WHERE document_id = ?" if document_id is not None else "") + " ORDER BY document_id, location_id", [document_id] if document_id is not None else []):
+                point = {"id": row["location_id"], "latitude": row["latitude"], "longitude": row["longitude"], "role": row["role"]}
+                if row["provenance_json"] is not None:
+                    if len(row["provenance_json"].encode("utf8")) > 16384: raise ValueError("location provenance exceeds 16384 bytes")
+                    point["provenance"] = json.loads(row["provenance_json"])
+                result.append((row["document_id"], validate_location(point)))
+            return result
+        result = []
+        if self.schema_version != 3: return result
+        for row in self.router.execute("SELECT id, meta_json FROM documents WHERE id LIKE 'qualla-%' AND meta_json IS NOT NULL"):
+            try:
+                meta = json.loads(row["meta_json"])
+                if not isinstance(meta.get("region"), str) or not isinstance(meta.get("quallaArticleIds"), list): continue
+                point = validate_location({"id": "qualla-coordinate", "role": "subject", "latitude": meta["coordinates"]["lat"], "longitude": meta["coordinates"]["lng"], "provenance": {"adapter": "qualla-regional-meta@1", "articleIds": meta["quallaArticleIds"]}})
+                if point["longitude"] == 180: point["longitude"] = -180
+                result.append((row["id"], point))
+            except (ValueError, TypeError, KeyError): pass
+        return result
+
+    def document_locations(self, document_id):
+        return [point for ident, point in self._location_rows(document_id) if ident == document_id]
+
+    def spatial_matches(self, radius):
+        validate_radius(radius)
+        matches = {}
+        for ident, point in self._location_rows():
+            if point["role"] != "subject": continue
+            distance = distance_meters(radius, point)
+            if distance > radius["radiusMeters"]: continue
+            previous = matches.get(ident)
+            if previous is None or (distance, point["id"]) < (previous["distanceMeters"], previous["matchedLocation"]["id"]):
+                matches[ident] = {"distanceMeters": distance, "matchedLocation": point}
+        return matches
+
+    def nearby_documents(self, radius, offset=0, limit=50):
+        matches = sorted(self.spatial_matches(radius).items(), key=lambda item: (item[1]["distanceMeters"], item[0]))
+        documents = []
+        for ident, match in matches[max(0, offset):max(0, offset) + min(500, max(1, limit))]:
+            row = self.router.execute(f"SELECT {self._document_columns()} FROM documents WHERE id = ?", [ident]).fetchone()
+            documents.append({**self._document_from_row(row), **match})
+        return {"documents": documents, "total": len(matches)}
+
     # ── search ────────────────────────────────────────────────────────────
-    def search_documents(self, query: str, limit: int = 10) -> list[DocumentHit]:
+    def search_documents(self, query: str, limit: int = 10, spatial: Optional[dict] = None) -> list[DocumentHit]:
         match = sanitize_fts_query(query)
         if not match:
             return []
+        scope = json.dumps(list(self.spatial_matches(spatial))) if spatial is not None else None
+        predicate = " AND f.document_id IN (SELECT value FROM json_each(?))" if scope is not None else ""
         rows = self.router.execute(
             "SELECT f.document_id, d.title FROM fts_documents f JOIN documents d ON d.id = f.document_id "
-            "WHERE fts_documents MATCH ? ORDER BY f.rank LIMIT ?",
-            [match, limit],
+            "WHERE fts_documents MATCH ?" + predicate + " ORDER BY f.rank LIMIT ?",
+            [match, scope, limit] if scope is not None else [match, limit],
         )
         return [DocumentHit(row["document_id"], row["title"], i) for i, row in enumerate(rows)]
 
-    def search_chunks(self, query: str, shard_ids: Optional[Sequence[int]] = None, limit_per_shard: int = 12) -> list[ChunkHit]:
+    def search_chunks(self, query: str, shard_ids: Optional[Sequence[int]] = None, limit_per_shard: int = 12, spatial: Optional[dict] = None) -> list[ChunkHit]:
         match = sanitize_fts_query(query)
         if not match:
             return []
+        scope = json.dumps(list(self.spatial_matches(spatial))) if spatial is not None else None
+        predicate = " AND c.document_id IN (SELECT value FROM json_each(?))" if scope is not None else ""
         hits: list[ChunkHit] = []
         for shard_id, path, _ in self.shards:
             if shard_ids is not None and shard_id not in shard_ids:
@@ -351,8 +446,8 @@ class Catalog:
             db = self._shard_db(path)
             rows = db.execute(
                 "SELECT c.chunk_uid, c.document_id, c.title, c.heading_path, c.line_start, c.line_end, c.text "
-                "FROM fts_chunks f JOIN chunks c ON c.id = f.rowid WHERE fts_chunks MATCH ? ORDER BY f.rank LIMIT ?",
-                [match, limit_per_shard],
+                "FROM fts_chunks f JOIN chunks c ON c.id = f.rowid WHERE fts_chunks MATCH ?" + predicate + " ORDER BY f.rank LIMIT ?",
+                [match, scope, limit_per_shard] if scope is not None else [match, limit_per_shard],
             )
             for row in rows:
                 hits.append(
@@ -396,13 +491,18 @@ class Catalog:
         scores = self.score_shards(query)
         return [shard_id for shard_id, _ in sorted(scores.items(), key=lambda kv: -kv[1])[:budget]]
 
-    def search_semantic(self, query: Sequence[float], final_k: int = 24, shard_budget: int = 6) -> list[ChunkHit]:
+    def search_semantic(self, query: Sequence[float], final_k: int = 24, shard_budget: int = 6, spatial: Optional[dict] = None) -> list[ChunkHit]:
         query_bits = quantize_bits(query)
         hits: list[ChunkHit] = []
-        for shard_id in self.route_shards(query, shard_budget):
+        allowed = set(self.spatial_matches(spatial)) if spatial is not None else None
+        routed = self.route_shards(query, shard_budget) if allowed is None else [int(row[0]) for row in self.router.execute("SELECT DISTINCT shard_id FROM documents WHERE id IN (SELECT value FROM json_each(?))", [json.dumps(list(allowed))])]
+        for shard_id in routed:
             path, chunk_count = next((p, c) for sid, p, c in self.shards if sid == shard_id)
             db = self._shard_db(path)
-            candidates = hamming_top_k(self.shard_bits(path), ceil(self.dimensions / 8), query_bits, rerank_k(final_k, chunk_count))
+            candidates = hamming_top_k(self.shard_bits(path), ceil(self.dimensions / 8), query_bits, chunk_count if allowed is not None else rerank_k(final_k, chunk_count))
+            if allowed is not None:
+                eligible = {int(row[0]) for row in db.execute("SELECT id FROM chunks WHERE document_id IN (SELECT value FROM json_each(?))", [json.dumps(list(allowed))])}
+                candidates = [hit for hit in candidates if hit[0] in eligible][:rerank_k(final_k, len(eligible))]
             scored = []
             for chunk_id, _ in candidates:
                 row = db.execute("SELECT v FROM chunk_vectors_int8 WHERE chunk_id = ?", [chunk_id]).fetchone()
@@ -443,7 +543,20 @@ class Catalog:
             f"router says format {self.format_version} / schema {self.schema_version}, "
             f"manifest says {m['formatVersion']} / {m['indexSchemaVersion']}",
         ))
-        topics = self.topics()
+        if m["formatVersion"] == "0.7":
+            try:
+                has_table = self.router.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='document_locations'").fetchone() is not None
+                checks.append(("document-locations-table", has_table, ""))
+                rows = self._location_rows()
+                grouped = {}
+                for ident, point in rows:
+                    if not self.router.execute("SELECT 1 FROM documents WHERE id = ?", [ident]).fetchone(): raise ValueError("location references missing document")
+                    if point["longitude"] == 180: raise ValueError("longitude must be normalized")
+                    grouped.setdefault(ident, []).append(point["id"])
+                if any(len(ids) > 256 or len(ids) != len(set(ids)) for ids in grouped.values()): raise ValueError("invalid location ids or count")
+                checks.append(("document-locations-summary", spatial_manifest(rows) == m.get("spatial"), ""))
+            except (ValueError, sqlite3.DatabaseError) as err: checks.append(("document-locations-integrity", False, str(err)))
+        topics = [dict(row) for row in self.router.execute("SELECT * FROM topics")]
         checks.append(("toc-present", len(topics) >= 1, f"{len(topics)} topics"))
         checks.append(("topics-tree", *topic_tree_problem(topics)))
         undeclared = self.router.execute(
@@ -467,7 +580,11 @@ class Catalog:
             checks.append(("counts-assets", declared_count == len(asset_files), f"manifest counts {declared_count} assets, files declare {len(asset_files)}"))
         checks.append(("license-notice", any(f["path"] == m["license"]["noticePath"] for f in m["files"]), ""))
         total_docs = self.router.execute("SELECT COUNT(*) FROM documents").fetchone()[0]
-        checks.append(("counts-documents", total_docs == m["counts"]["documents"] and sum(t["document_count"] for t in topics) == total_docs, f"{total_docs}"))
+        checks.append(("counts-documents", total_docs == m["counts"]["documents"], f"{total_docs}"))
+        try:
+            checks.extend(self._toc_checks())
+        except sqlite3.DatabaseError as error:
+            checks.append(("toc-references", False, f"invalid TOC structure: {error}"))
         checks.append(("counts-shards", len(self.shards) == m["counts"]["shards"], f"{len(self.shards)}"))
         checks.append(("counts-chunks", sum(c for _, _, c in self.shards) == m["counts"]["chunks"], ""))
         if deep:
@@ -491,6 +608,40 @@ class Catalog:
                 top = [h.document_id for h in self.search_documents(smoke["query"], SMOKE_QUERY_TOP_N)]
                 missing = [d for d in smoke["expectedDocumentIds"] if d not in top]
                 checks.append((f"smoke:{smoke['query']}", not missing, ", ".join(missing)))
+        return checks
+
+    def _toc_checks(self) -> list[tuple[str, bool, str]]:
+        def count(sql: str) -> int:
+            return int(self.router.execute(sql).fetchone()[0])
+
+        relation = "topic_documents" if self.schema_version >= 4 else "documents"
+        incorrect = count(f"""
+            SELECT COUNT(*) FROM topics t LEFT JOIN
+            (SELECT topic_id, COUNT(*) AS n FROM {relation} GROUP BY topic_id) r ON r.topic_id = t.id
+            WHERE t.document_count != COALESCE(r.n, 0)
+        """)
+        checks = [("toc-counts", incorrect == 0, f"{incorrect} incorrect direct topic counts")]
+        if self.schema_version < 4:
+            return checks
+        invalid = count("""
+            SELECT COUNT(*) FROM topic_documents r
+            LEFT JOIN documents d ON d.id = r.document_id LEFT JOIN topics t ON t.id = r.topic_id
+            WHERE d.id IS NULL OR t.id IS NULL OR
+              (r.ordinal IS NOT NULL AND (typeof(r.ordinal) != 'integer' OR
+               r.ordinal < -2147483648 OR r.ordinal > 2147483647))
+        """)
+        missing = count("""
+            SELECT COUNT(*) FROM documents d WHERE NOT EXISTS (
+              SELECT 1 FROM topic_documents r WHERE r.document_id = d.id
+                AND r.topic_id = d.topic_id AND r.ordinal IS d.ordinal)
+        """)
+        duplicates = count("""
+            SELECT COUNT(*) FROM (SELECT topic_id, document_id FROM topic_documents
+              GROUP BY topic_id, document_id HAVING COUNT(*) > 1)
+        """)
+        checks.append(("toc-references", invalid == missing == duplicates == 0,
+                       f"{invalid} invalid references, {missing} missing/mismatched primary rows, "
+                       f"{duplicates} duplicate pairs"))
         return checks
 
     def _deep_checks_0_6(self, asset_files: list[dict]) -> list[tuple[str, bool, str]]:
